@@ -1,0 +1,18 @@
+services:
+  video-browser:
+    build: .
+    container_name: video-browser
+    ports:
+      - "127.0.0.1:${VB_PORT:-8000}:8000"
+    environment:
+      VB_PATH_MAP: ${VB_PATH_MAP:-}
+      VB_ROOT_LABELS: ${VB_ROOT_LABELS:-}
+    volumes:
+      - "${CATALOG_DIR:?Set CATALOG_DIR in .env}:/data:ro"
+      - "${MEDIA_1:?Set MEDIA_1 in .env}:/media/1:ro"
+      - "${MEDIA_2:-./.empty}:/media/2:ro"
+      - previews:/cache
+    restart: unless-stopped
+
+volumes:
+  previews:

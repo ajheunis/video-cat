@@ -1,0 +1,12 @@
+# Personal catalog data - never commit
+*.duckdb
+*.duckdb.wal
+*.wal
+.env
+
+# Preview cache and placeholder mount
+previews/
+.empty/
+
+__pycache__/
+*.pyc
