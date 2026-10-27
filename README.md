@@ -17,6 +17,10 @@ play with ffmpeg.
 - Bulk edit: tick clips (shift-click for a range, or the header box for a
   whole day) and set or clear their Project and/or Location. Changes are
   written to every file of each clip in the catalog.
+- Copy a clip’s original catalog path, or use **Files** to copy a related file’s path.
+- Mark a clip as a favorite and use **Favorites only** to filter the catalog.
+  Favorites are stored on all files in the clip; the app adds the `favorite`
+  Boolean column on first use if needed.
 - Mark selected clips for deletion, or use **Files** to mark individual files.
   Marked files remain in the catalog and on disk; you can unmark them at any time.
   Use **Marked for deletion only** to show clips with at least one marked file.
@@ -98,6 +102,7 @@ The app expects a DuckDB 2 database with a `videos` table:
 | `nas_path`     | VARCHAR   | set when a NAS backup exists                |
 | `dup_of`       | VARCHAR   | set when the file duplicates another        |
 | `marked_for_deletion` | BOOLEAN | optional; true marks a file for deletion |
+| `favorite`     | BOOLEAN   | optional; true marks a file as a favorite |
 
 An optional `projects` table (`project`, `resolve_project`, `editing_media`,
 `notes`) adds hover notes to project tags.
@@ -105,7 +110,7 @@ An optional `projects` table (`project`, `resolve_project`, `editing_media`,
 ## Security
 
 There is no authentication. Anyone who can reach the port can browse the
-catalog, stream any file in it, and edit project/location values and deletion markers. Keep it bound to `127.0.0.1` (the default,
+catalog, stream any file in it, and edit project/location values, favorites, and deletion markers. Keep it bound to `127.0.0.1` (the default,
 and what `compose.yaml` does). POST endpoints require a custom header and
 media requests reject cross-site fetches, so other websites can't drive it.
 

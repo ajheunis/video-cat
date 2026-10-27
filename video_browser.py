@@ -121,7 +121,7 @@ NEVER_PREVIEW = {".nev", ".gyro"}       # N-RAW and gyro data can't be decoded
 
 FILES_SQL = """
 SELECT filename, ext, kind, device, capture_date, size_bytes, modified,
-       rel_path, location, project, collection, storage_root, nas_path, dup_of
+       rel_path, full_path, location, project, collection, storage_root, nas_path, dup_of
 FROM videos
 ORDER BY capture_date DESC NULLS LAST, rel_path
 """
@@ -202,7 +202,8 @@ def load_data():
     with db() as con:
         columns = {row[1] for row in con.execute("PRAGMA table_info('videos')").fetchall()}
         marker = "COALESCE(marked_for_deletion, FALSE)" if "marked_for_deletion" in columns else "FALSE"
-        cur = con.execute(FILES_SQL.replace("FROM videos", f", {marker} AS marked_for_deletion FROM videos"))
+        favorite = "COALESCE(favorite, FALSE)" if "favorite" in columns else "FALSE"
+        cur = con.execute(FILES_SQL.replace("FROM videos", f", {marker} AS marked_for_deletion, {favorite} AS favorite FROM videos"))
         cols = [d[0] for d in cur.description]
         files = [dict(zip(cols, r)) for r in cur.fetchall()]
         projects = load_projects(con)
@@ -232,12 +233,13 @@ def load_data():
         g["clips"].append({
             "time": t, "time_src": tsrc, "device": device or "", "root": root,
             "collection": primary["collection"], "location": loc, "project": proj,
-            "file": primary["filename"], "rel": primary["rel_path"],
+            "file": primary["filename"], "rel": primary["rel_path"], "path": primary["full_path"],
             "rels": [f["rel_path"] for f in fs],
             "file_details": [{"rel": f["rel_path"], "name": f["filename"],
-                              "kind": f["kind"], "marked": f["marked_for_deletion"]}
+                              "kind": f["kind"], "path": f["full_path"], "marked": f["marked_for_deletion"]}
                              for f in sorted(fs, key=lambda f: f["rel_path"])],
             "marked_count": sum(bool(f["marked_for_deletion"]) for f in fs),
+            "favorite": any(f["favorite"] for f in fs),
             "folder": os.path.dirname(primary["rel_path"] or ""),
             "files": len(fs), "video_files": len(videos),
             "all": sorted(f["filename"] + ("" if f["kind"] == "video" else f"  ({f['kind']})")
@@ -309,17 +311,17 @@ def update_clips(rels, changes):
     return {"ok": True, "updated": n}
 
 
-def mark_files(rels, marked):
+def mark_files(rels, marked, column="marked_for_deletion"):
     """Mark catalog rows without modifying the media files."""
     rels = sorted({r for r in rels if isinstance(r, str) and r})
-    if not rels or not isinstance(marked, bool):
+    if not rels or not isinstance(marked, bool) or column not in ("marked_for_deletion", "favorite"):
         return {"ok": False, "error": "Select files and choose a valid marker."}
     try:
         with db(read_only=False) as con:
             con.execute("BEGIN TRANSACTION")
             try:
-                con.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS marked_for_deletion BOOLEAN DEFAULT FALSE")
-                n = con.execute("UPDATE videos SET marked_for_deletion = ? WHERE list_contains(?, rel_path)",
+                con.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {column} BOOLEAN DEFAULT FALSE")
+                n = con.execute(f"UPDATE videos SET {column} = ? WHERE list_contains(?, rel_path)",
                                 [marked, rels]).fetchone()[0]
                 con.execute("COMMIT")
             except Exception:
@@ -559,7 +561,7 @@ PAGE = r"""<!doctype html>
   .badge.dup,.badge.marked{color:var(--bad);border:1px solid #6a3030}
   .drv{color:var(--muted);font-size:12px;white-space:nowrap}
   .act{display:flex;gap:6px;justify-content:flex-end}
-  .act button{padding:4px 8px;font-size:12px;line-height:1}
+  .act button{padding:4px 8px;font-size:12px;line-height:1;white-space:nowrap}
   .muted{color:var(--muted)}
   .hide{display:none!important}
   .empty{color:var(--muted);padding:30px;text-align:center}
@@ -581,6 +583,7 @@ PAGE = r"""<!doctype html>
   #selbar input[type=text]:focus{border-color:var(--accent)}
   #selbar input[type=text]:disabled{opacity:.4}
   #selbar button.go{background:#25344f;border-color:#36507a;color:#cfe0ff}
+  .act button.favorite-on{color:#f4cf76;border-color:#806b3f;background:#39301f}
   .act button.pv{color:#cfe0ff;border-color:#36507a;background:#1f2b40}
   .act button:disabled{opacity:.35;cursor:not-allowed;border-color:var(--line)}
   #pv{position:fixed;inset:0;background:#05070bdd;z-index:30;display:none;align-items:center;justify-content:center;padding:24px}
@@ -615,7 +618,9 @@ PAGE = r"""<!doctype html>
   #files-dialog::backdrop{background:#05070bdd}
   #files-dialog h2{margin:0 0 8px;font-size:18px}
   #files-dialog p{color:var(--muted)}
-  #file-list label{display:flex;align-items:center;gap:8px;padding:8px 0;overflow-wrap:anywhere}
+  #file-list .file-row{display:flex;align-items:center;gap:8px;padding:8px 0}
+  #file-list label{display:flex;align-items:center;gap:8px;flex:1;min-width:0;overflow-wrap:anywhere}
+  #file-list .fn{white-space:normal}
   #files-dialog .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
   footer{color:var(--muted);font-size:11.5px;padding-bottom:40px}
   code{background:var(--panel2);padding:1px 6px;border-radius:5px}
@@ -630,6 +635,7 @@ PAGE = r"""<!doctype html>
     <span class="seg" id="roots"></span>
     <input id="q" type="search" aria-label="Filter catalog" placeholder="Filter by date, file, device, location, project...">
     <label><input type="checkbox" id="marked-only"> Marked for deletion only</label>
+    <label><input type="checkbox" id="favorites-only"> Favorites only</label>
     <button id="expand">Expand all</button>
     <button id="collapse">Collapse all</button>
     <button id="reload">&#8635; Reload</button>
@@ -758,7 +764,7 @@ function render(){
         <td>${c.location?`<span class="tag">${esc(c.location)}</span>`:'<span class="muted">-</span>'}</td>
         <td>${c.project?`<span class="tag pj"${pt?` title="${esc(pt)}"`:''}>${esc(c.project)}</span>`:'<span class="muted">-</span>'}</td>
         <td class="num muted">${c.files}</td><td class="num">${fmt(c.size)}</td>
-        <td><div class="act"><button data-files="${esc(c.rel)}" title="View and mark individual files">Files</button><button class="pv" data-pv="${g.date}|${i}" ${c.pv.length?'title="Preview in the browser"':'disabled title="Nothing previewable - N-RAW (.NEV) without a proxy"'}>&#128065;</button>
+        <td><div class="act"><button data-favorite="${esc(c.rel)}" class="${c.favorite?'favorite-on':''}" aria-pressed="${c.favorite}" title="${c.favorite?'Remove from favorites':'Add to favorites'}">${c.favorite?'★ Favorite':'☆ Favorite'}</button><button data-copy-path="${esc(c.path||'')}" ${c.path?'':'disabled'} title="Copy catalog path">Copy path</button><button data-files="${esc(c.rel)}" title="View and mark individual files">Files</button><button class="pv" data-pv="${g.date}|${i}" ${c.pv.length?'title="Preview in the browser"':'disabled title="Nothing previewable - N-RAW (.NEV) without a proxy"'}>&#128065;</button>
           <button data-rel="${esc(c.rel)}" data-mode="play" title="Open in your default player">&#9654;</button>
           <button data-rel="${esc(c.rel)}" data-mode="folder" title="Show in folder">&#128193;</button></div></td></tr>`}).join('');
     d.innerHTML=`<summary><span class="caret">&#9654;</span>
@@ -789,11 +795,12 @@ function section(cls,label,key){
 function applyFilter(){
   const q=document.getElementById('q').value.trim().toLowerCase();
   const markedOnly=document.getElementById('marked-only').checked;
+  const favoritesOnly=document.getElementById('favorites-only').checked;
   let dates=0,clips=0,vfiles=0,bytes=0;
   document.querySelectorAll('.day').forEach(day=>{
     let shown=0,sz=0;const devs=new Set();
     day.querySelectorAll('tbody tr').forEach((tr,i)=>{
-      const hit=(ROOT==='all'||tr.dataset.root===ROOT)&&(!q||tr.dataset.blob.includes(q))&&(!markedOnly||day._clips[i].marked_count>0);
+      const hit=(ROOT==='all'||tr.dataset.root===ROOT)&&(!q||tr.dataset.blob.includes(q))&&(!markedOnly||day._clips[i].marked_count>0)&&(!favoritesOnly||day._clips[i].favorite);
       tr.classList.toggle('hide',!hit);
       if(hit){shown++;sz+=+tr.dataset.size;vfiles+=+tr.dataset.vf;devs.add(day._clips[i].device)}});
     day.classList.toggle('hide',shown===0);
@@ -802,7 +809,7 @@ function applyFilter(){
     day.querySelector('.count').textContent=shown+' clip'+(shown===1?'':'s');
     day.querySelector('.chips').innerHTML=[...devs].sort().map(x=>`<span class="chip">${esc(x)}</span>`).join('');
     day.querySelector('.sz').textContent=fmt(sz);
-    if(q||markedOnly) day.open=shown>0;
+    if(q||markedOnly||favoritesOnly) day.open=shown>0;
   });
   document.querySelectorAll('.grp').forEach(grp=>{
     let n=0,days=0,sz=0;
@@ -811,7 +818,7 @@ function applyFilter(){
     grp.querySelector(':scope>summary .count').textContent=
       n+' clip'+(n===1?'':'s')+' · '+days+' day'+(days===1?'':'s');
     grp.querySelector(':scope>summary .sz').textContent=fmt(sz);
-    if(q||markedOnly) grp.open=n>0;
+    if(q||markedOnly||favoritesOnly) grp.open=n>0;
   });
   updateSel();
   document.getElementById('stats').innerHTML=[['Dates',dates],['Clips',clips],['Video files',vfiles],['Total',fmt(bytes)]]
@@ -874,9 +881,28 @@ document.getElementById('main').addEventListener('click',e=>{
   const b=e.target.closest('button[data-files]');if(!b)return;
   const c=CLIPS[b.dataset.files];if(!c)return;
   document.getElementById('file-list').innerHTML=c.file_details.map(f=>
-    `<label><input type="checkbox" data-file-rel="${esc(f.rel)}"><span class="fn">${esc(f.name)}</span>
-      <span class="muted">${esc(f.kind||'')}</span>${f.marked?'<span class="badge marked">marked for deletion</span>':''}</label>`).join('');
+    `<div class="file-row"><label><input type="checkbox" data-file-rel="${esc(f.rel)}"><span class="fn">${esc(f.name)}</span>
+      <span class="muted">${esc(f.kind||'')}</span>${f.marked?'<span class="badge marked">marked for deletion</span>':''}</label>
+      <button data-copy-path="${esc(f.path||'')}" ${f.path?'':'disabled'}>Copy path</button></div>`).join('');
   filesDialog.showModal();
+});
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-copy-path]');if(!b)return;
+  try{
+    if(!navigator.clipboard||!navigator.clipboard.writeText)throw new Error('Clipboard unavailable');
+    await navigator.clipboard.writeText(b.dataset.copyPath);toast('Catalog path copied.',true);
+  }catch(err){toast('Could not copy the path. Check browser clipboard permissions.')}
+});
+document.getElementById('main').addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-favorite]');if(!b)return;
+  const c=CLIPS[b.dataset.favorite];if(!c)return;
+  b.disabled=true;
+  try{
+    const r=await fetch('/api/favorite',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
+      body:JSON.stringify({rels:c.rels,marked:!c.favorite})});
+    const j=await r.json();if(!j.ok){toast(j.error||'Could not save favorite.');b.disabled=false;return}
+    await load();toast(c.favorite?'Removed from favorites.':'Added to favorites.',true);
+  }catch(err){b.disabled=false;toast('Could not save favorite.')}
 });
 document.getElementById('files-close').onclick=()=>filesDialog.close();
 for(const [id,marked] of [['files-mark',true],['files-unmark',false]])
@@ -972,6 +998,7 @@ document.getElementById('main').addEventListener('click',e=>{
 document.getElementById('q').addEventListener('input',applyFilter);
 // Expand opens years and months only, so the result is an outline of days rather than every clip.
 document.getElementById('marked-only').onchange=applyFilter;
+document.getElementById('favorites-only').onchange=applyFilter;
 document.getElementById('expand').onclick=()=>document.querySelectorAll('.grp:not(.hide)').forEach(d=>d.open=true);
 document.getElementById('collapse').onclick=()=>document.querySelectorAll('.grp,.day').forEach(d=>d.open=false);
 document.getElementById('reload').onclick=load;
@@ -1071,7 +1098,7 @@ class Handler(BaseHTTPRequestHandler):
         # The custom header forces a CORS preflight, so other websites open in
         # your browser can't trigger file opens on this local server.
         path = urlparse(self.path).path
-        if (path not in ("/api/open", "/api/preview", "/api/update", "/api/settings", "/api/mark-deletion")
+        if (path not in ("/api/open", "/api/preview", "/api/update", "/api/settings", "/api/mark-deletion", "/api/favorite")
                 or self.headers.get("X-Video-Browser") != "1"):
             self.send_error(403)
             return
@@ -1090,6 +1117,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/mark-deletion":
                 rels = req.get("rels") if isinstance(req.get("rels"), list) else []
                 self._json(mark_files(rels[:20000], req.get("marked")))
+            elif path == "/api/favorite":
+                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
+                self._json(mark_files(rels[:20000], req.get("marked"), "favorite"))
             elif path == "/api/update":
                 rels = req.get("rels") if isinstance(req.get("rels"), list) else []
                 changes = {k: req[k] for k in EDITABLE if k in req}
