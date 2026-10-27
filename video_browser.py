@@ -399,6 +399,15 @@ PAGE = r"""<!doctype html>
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
   .dot.on{background:var(--ok)}.dot.off{background:var(--muted);opacity:.5}
   main{padding:16px 22px 60px;max-width:1280px}
+  .grp>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:14px;padding:10px 6px;border-radius:9px}
+  .grp>summary::-webkit-details-marker{display:none}
+  .grp>summary:hover{background:var(--panel2)}
+  .grp.yr{margin-bottom:6px}
+  .grp.yr>summary .date{font-size:17px;font-weight:700}
+  .grp.mo{margin-left:18px}
+  .grp.mo>summary .date{font-weight:600}
+  .grp>.kids{padding:2px 0 8px}
+  .grp.mo>.kids{margin-left:18px}
   .day{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden;background:var(--panel)}
   .day>summary{list-style:none;cursor:pointer;padding:13px 16px;display:flex;align-items:center;gap:14px}
   .day>summary::-webkit-details-marker{display:none}
@@ -518,7 +527,12 @@ function render(){
   document.getElementById('dbline').innerHTML='DB: <code>'+esc(s.db)+'</code> - '+s.rows+' files - loaded '+esc(s.loaded);
   renderRoots();
   const main=document.getElementById('main');main.innerHTML='';
+  let yEl=null,mEl=null,yKey=null,mKey=null;
   DATA.groups.forEach(g=>{
+    const known=g.date!=='unknown',y=known?g.date.slice(0,4):'unknown',m=known?g.date.slice(0,7):'unknown';
+    if(y!==yKey){yKey=y;mKey=null;yEl=section('yr',known?y:'No date');if(!main.firstChild)yEl.open=true;main.appendChild(yEl)}
+    if(m!==mKey){mKey=m;mEl=section('mo',known?new Date(+y,+m.slice(5)-1,1).toLocaleString(undefined,{month:'long'}):'No date');
+      yEl.lastElementChild.appendChild(mEl)}
     const d=document.createElement('details');d.className='day';d.dataset.date=g.date;
     const rows=g.clips.map((c,i)=>{
       const pt=c.project?projTitle(c.project):'';
@@ -543,9 +557,15 @@ function render(){
         <th>Project</th><th class="num">Files</th><th class="num">Size</th><th></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`;
     d._clips=g.clips;
-    main.appendChild(d);
+    mEl.lastElementChild.appendChild(d);
   });
   applyFilter();
+}
+function section(cls,label){
+  const s=document.createElement('details');s.className='grp '+cls;
+  s.innerHTML=`<summary><span class="caret">&#9654;</span><span class="date">${esc(label)}</span>
+    <span class="count"></span><span class="spacer"></span><span class="sz"></span></summary><div class="kids"></div>`;
+  return s;
 }
 function applyFilter(){
   const q=document.getElementById('q').value.trim().toLowerCase();
@@ -557,11 +577,21 @@ function applyFilter(){
       tr.classList.toggle('hide',!hit);
       if(hit){shown++;sz+=+tr.dataset.size;vfiles+=+tr.dataset.vf;devs.add(day._clips[i].device)}});
     day.classList.toggle('hide',shown===0);
+    day._shown=shown;day._sz=sz;
     if(shown){dates++;clips+=shown;bytes+=sz}
     day.querySelector('.count').textContent=shown+' clip'+(shown===1?'':'s');
     day.querySelector('.chips').innerHTML=[...devs].sort().map(x=>`<span class="chip">${esc(x)}</span>`).join('');
     day.querySelector('.sz').textContent=fmt(sz);
     if(q) day.open=shown>0;
+  });
+  document.querySelectorAll('.grp').forEach(grp=>{
+    let n=0,days=0,sz=0;
+    grp.querySelectorAll('.day').forEach(d=>{if(d._shown){n+=d._shown;days++;sz+=d._sz}});
+    grp.classList.toggle('hide',n===0);
+    grp.querySelector(':scope>summary .count').textContent=
+      n+' clip'+(n===1?'':'s')+' · '+days+' day'+(days===1?'':'s');
+    grp.querySelector(':scope>summary .sz').textContent=fmt(sz);
+    if(q) grp.open=n>0;
   });
   document.getElementById('stats').innerHTML=[['Dates',dates],['Clips',clips],['Video files',vfiles],['Total',fmt(bytes)]]
     .map(([k,v])=>`<div class="stat"><b>${v}</b><span>${k}</span></div>`).join('');
@@ -613,7 +643,8 @@ function pvStep(d){
   if(!PV.btn)return;
   const all=[...document.querySelectorAll('.day:not(.hide) tr:not(.hide) button.pv:not(:disabled)')];
   const k=all.indexOf(PV.btn);const nb=all[k+d];
-  if(nb){const day=nb.closest('details');if(day)day.open=true;nb.scrollIntoView({block:'nearest'});pvOpen(nb)}
+  if(nb){for(let p=nb.closest('details');p;p=p.parentElement.closest('details'))p.open=true;
+    nb.scrollIntoView({block:'nearest'});pvOpen(nb)}
 }
 document.getElementById('pvclose').onclick=pvClose;
 document.getElementById('pvprev').onclick=()=>pvStep(-1);
@@ -634,8 +665,9 @@ document.getElementById('main').addEventListener('click',e=>{
   const b=e.target.closest('button.pv');if(b&&!b.disabled){e.preventDefault();pvOpen(b)}
 });
 document.getElementById('q').addEventListener('input',applyFilter);
-document.getElementById('expand').onclick=()=>document.querySelectorAll('.day:not(.hide)').forEach(d=>d.open=true);
-document.getElementById('collapse').onclick=()=>document.querySelectorAll('.day').forEach(d=>d.open=false);
+// Expand opens years and months only, so the result is an outline of days rather than every clip.
+document.getElementById('expand').onclick=()=>document.querySelectorAll('.grp:not(.hide)').forEach(d=>d.open=true);
+document.getElementById('collapse').onclick=()=>document.querySelectorAll('.grp,.day').forEach(d=>d.open=false);
 document.getElementById('reload').onclick=load;
 load();
 </script>
