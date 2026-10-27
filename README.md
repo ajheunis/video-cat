@@ -14,7 +14,14 @@ play with ffmpeg.
   original). Unsupported codecs are converted once to a small H.264 copy and
   cached.
 
-The data is read live from the DuckDB file on every request, opened read-only.
+- Bulk edit: tick clips (shift-click for a range, or the header box for a
+  whole day) and set or clear their Project and/or Location. Changes are
+  written to every file of each clip in the catalog.
+
+The data is read live from the DuckDB file on every request. Connections are
+short-lived, so the file is only locked while a request runs; if another
+program has the catalog open for writing, edits fail with a message instead
+of waiting. Back up the catalog before bulk-editing.
 
 ## Run with Docker (recommended)
 
@@ -29,7 +36,7 @@ Open <http://127.0.0.1:8000>.
 
 | Variable         | Meaning                                                        |
 |------------------|----------------------------------------------------------------|
-| `CATALOG_DIR`    | Folder containing `videos_catalog.duckdb` (mounted read-only)  |
+| `CATALOG_DIR`    | Folder containing `videos_catalog.duckdb` (mounted read-write) |
 | `MEDIA_1`        | Drive/folder holding videos, mounted at `/media/1`             |
 | `MEDIA_2`        | Optional second drive/folder, mounted at `/media/2`            |
 | `VB_PATH_MAP`    | Maps catalog roots to mounts, e.g. `H:/=/media/1;F:/=/media/2` |
@@ -79,7 +86,7 @@ An optional `projects` table (`project`, `resolve_project`, `editing_media`,
 ## Security
 
 There is no authentication. Anyone who can reach the port can browse the
-catalog and stream any file in it. Keep it bound to `127.0.0.1` (the default,
+catalog, stream any file in it, and edit project/location values. Keep it bound to `127.0.0.1` (the default,
 and what `compose.yaml` does). POST endpoints require a custom header and
 media requests reject cross-site fetches, so other websites can't drive it.
 

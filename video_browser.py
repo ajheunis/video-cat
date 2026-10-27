@@ -31,7 +31,7 @@ Config (all optional, environment variables):
   VB_ROOT_LABELS  "H:/=H: Processed;F:/=F: Raw"  display names for storage roots
   VB_PATH_MAP     "H:/=/media/1;F:/=/media/2"    where catalog paths are mounted
 """
-import json, os, re, sys, datetime, subprocess, hashlib, shutil, threading, tempfile
+import json, os, re, sys, datetime, subprocess, hashlib, shutil, threading, tempfile, contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -126,6 +126,22 @@ def preview_candidates(files):
     return [rel for r, _, rel in sorted(x for x in ranked if x[0] is not None)]
 
 
+# DuckDB won't hold read-only and read-write handles to one file in the same
+# process, so connections are opened one at a time. Each is short-lived, which
+# also keeps the file free for other programs between requests.
+_db_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def db(read_only=True):
+    with _db_lock:
+        con = duckdb.connect(DB_PATH, read_only=read_only)
+        try:
+            yield con
+        finally:
+            con.close()
+
+
 def load_projects(con):
     try:
         rows = con.execute(
@@ -136,14 +152,11 @@ def load_projects(con):
 
 
 def load_data():
-    con = duckdb.connect(DB_PATH, read_only=True)
-    try:
+    with db() as con:
         cur = con.execute(FILES_SQL)
         cols = [d[0] for d in cur.description]
         files = [dict(zip(cols, r)) for r in cur.fetchall()]
         projects = load_projects(con)
-    finally:
-        con.close()
 
     clips = {}
     roots = {}
@@ -171,6 +184,7 @@ def load_data():
             "time": t, "time_src": tsrc, "device": device or "", "root": root,
             "collection": primary["collection"], "location": loc, "project": proj,
             "file": primary["filename"], "rel": primary["rel_path"],
+            "rels": [f["rel_path"] for f in fs],
             "folder": os.path.dirname(primary["rel_path"] or ""),
             "files": len(fs), "video_files": len(videos),
             "all": sorted(f["filename"] + ("" if f["kind"] == "video" else f"  ({f['kind']})")
@@ -200,11 +214,8 @@ def load_data():
 
 
 def lookup_path(rel):
-    con = duckdb.connect(DB_PATH, read_only=True)
-    try:
+    with db() as con:
         row = con.execute("SELECT full_path FROM videos WHERE rel_path = ?", [rel]).fetchone()
-    finally:
-        con.close()
     return local_path(row[0]) if row else None
 
 
@@ -212,14 +223,37 @@ def lookup_paths(rels):
     rels = [r for r in rels if isinstance(r, str)][:20]
     if not rels:
         return {}
-    con = duckdb.connect(DB_PATH, read_only=True)
-    try:
+    with db() as con:
         rows = con.execute(
             f"SELECT rel_path, full_path FROM videos WHERE rel_path IN ({','.join('?' * len(rels))})",
             rels).fetchall()
-    finally:
-        con.close()
     return {rel: local_path(full) for rel, full in rows}
+
+
+EDITABLE = ("project", "location")
+
+
+def update_clips(rels, changes):
+    """Set project and/or location on catalog rows. A blank value clears the field."""
+    rels = sorted({r for r in rels if isinstance(r, str)})
+    if not rels:
+        return {"ok": False, "error": "Nothing selected."}
+    sets, args = [], []
+    for col in EDITABLE:
+        if col in changes:
+            v = changes[col].strip()[:200] if isinstance(changes[col], str) else ""
+            sets.append(f"{col} = ?")
+            args.append(v or None)
+    if not sets:
+        return {"ok": False, "error": "Tick Project and/or Location to change."}
+    try:
+        with db(read_only=False) as con:
+            n = con.execute(f"UPDATE videos SET {', '.join(sets)} WHERE list_contains(?, rel_path)",
+                            args + [rels]).fetchone()[0]
+    except duckdb.Error as e:
+        return {"ok": False, "error": "Couldn't save - the catalog may be open in another program "
+                f"or mounted read-only.\n{e}"}
+    return {"ok": True, "updated": n}
 
 
 # ---------------------------------------------------------------- previews --
@@ -449,6 +483,21 @@ PAGE = r"""<!doctype html>
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#3a2026;
     border:1px solid #6a3030;color:#ffd7d7;padding:10px 14px;border-radius:9px;font-size:12.5px;
     white-space:pre-line;max-width:90vw;display:none;z-index:20}
+  #toast.ok{background:#1d3328;border-color:#2c5a45;color:#d2f5e3}
+  th.sel,td.sel{width:1%;padding-right:0}
+  input[type=checkbox]{accent-color:var(--accent);cursor:pointer}
+  tbody tr.on{background:#1c2638}
+  #selbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:15;display:none;
+    align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel2);border:1px solid #36507a;
+    border-radius:12px;padding:10px 14px;box-shadow:0 10px 40px #000a;max-width:calc(100vw - 32px)}
+  body.selecting #selbar{display:flex}
+  body.selecting main{padding-bottom:130px}
+  #selbar label{color:var(--muted);font-size:12.5px;display:flex;align-items:center;gap:5px;white-space:nowrap}
+  #selbar input[type=text]{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;
+    padding:6px 9px;font-size:13px;width:170px;outline:none}
+  #selbar input[type=text]:focus{border-color:var(--accent)}
+  #selbar input[type=text]:disabled{opacity:.4}
+  #selbar button.go{background:#25344f;border-color:#36507a;color:#cfe0ff}
   .act button.pv{color:#cfe0ff;border-color:#36507a;background:#1f2b40}
   .act button:disabled{opacity:.35;cursor:not-allowed;border-color:var(--line)}
   #pv{position:fixed;inset:0;background:#05070bdd;z-index:30;display:none;align-items:center;justify-content:center;padding:24px}
@@ -484,6 +533,13 @@ PAGE = r"""<!doctype html>
 </header>
 <main id="main"><div class="empty">Loading...</div></main>
 <div id="toast"></div>
+<div id="selbar"><b id="selcount"></b>
+  <label><input type="checkbox" id="setpj"> Project</label>
+  <input type="text" id="pj" list="pjlist" placeholder="blank clears it" disabled>
+  <label><input type="checkbox" id="setloc"> Location</label>
+  <input type="text" id="loc" list="loclist" placeholder="blank clears it" disabled>
+  <button class="go" id="apply">Apply</button><button id="selnone">Clear selection</button></div>
+<datalist id="pjlist"></datalist><datalist id="loclist"></datalist>
 <div id="pv"><div class="box">
   <div class="bar"><span class="ttl">Preview <span class="fn" id="pvname"></span></span>
     <span class="how" id="pvhow"></span><span class="spacer"></span>
@@ -497,7 +553,8 @@ PAGE = r"""<!doctype html>
 <footer>Data read live from the DuckDB file on each reload. Times in <i>italics</i> come from the
 file's modified time; the rest from the filename. Runs locally only.</footer>
 <script>
-let DATA=null, ROOT='all';
+let DATA=null, ROOT='all', CLIPS={}, LAST=null;
+const SEL=new Set();   // primary rel_path of each selected clip
 try{ROOT=localStorage.getItem('vb.root')||'all'}catch(e){}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=b=>{const mb=b/1048576;return mb>=1048576?(mb/1048576).toFixed(2)+' TB':mb>=1024?(mb/1024).toFixed(2)+' GB':Math.round(mb)+' MB'};
@@ -526,18 +583,24 @@ function render(){
   const s=DATA.summary;
   document.getElementById('dbline').innerHTML='DB: <code>'+esc(s.db)+'</code> - '+s.rows+' files - loaded '+esc(s.loaded);
   renderRoots();
-  const main=document.getElementById('main');main.innerHTML='';
+  const main=document.getElementById('main'),scroll=window.scrollY;
+  // Keep whatever was expanded across reloads; first load opens the newest year.
+  const wasOpen=new Set([...main.querySelectorAll('details[open]')].map(d=>d.dataset.key));
+  main.innerHTML='';CLIPS={};
+  const pjs=new Set(Object.keys(DATA.projects)),locs=new Set();
   let yEl=null,mEl=null,yKey=null,mKey=null;
   DATA.groups.forEach(g=>{
     const known=g.date!=='unknown',y=known?g.date.slice(0,4):'unknown',m=known?g.date.slice(0,7):'unknown';
-    if(y!==yKey){yKey=y;mKey=null;yEl=section('yr',known?y:'No date');if(!main.firstChild)yEl.open=true;main.appendChild(yEl)}
-    if(m!==mKey){mKey=m;mEl=section('mo',known?new Date(+y,+m.slice(5)-1,1).toLocaleString(undefined,{month:'long'}):'No date');
+    if(y!==yKey){yKey=y;mKey=null;yEl=section('yr',known?y:'No date','y'+y);main.appendChild(yEl)}
+    if(m!==mKey){mKey=m;mEl=section('mo',known?new Date(+y,+m.slice(5)-1,1).toLocaleString(undefined,{month:'long'}):'No date','m'+m);
       yEl.lastElementChild.appendChild(mEl)}
-    const d=document.createElement('details');d.className='day';d.dataset.date=g.date;
+    const d=document.createElement('details');d.className='day';d.dataset.date=g.date;d.dataset.key='d'+g.date;
     const rows=g.clips.map((c,i)=>{
-      const pt=c.project?projTitle(c.project):'';
+      CLIPS[c.rel]=c;if(c.project)pjs.add(c.project);if(c.location)locs.add(c.location);
+      const pt=c.project?projTitle(c.project):'',on=SEL.has(c.rel);
       const blob=[g.date,c.device,c.location,c.project,c.file,c.folder,rootLabel(c.root)].join(' ').toLowerCase();
-      return `<tr data-root="${esc(c.root)}" data-size="${c.size}" data-vf="${c.video_files}" data-blob="${esc(blob)}">
+      return `<tr class="${on?'on':''}" data-root="${esc(c.root)}" data-size="${c.size}" data-vf="${c.video_files}" data-blob="${esc(blob)}">
+        <td class="sel"><input type="checkbox" data-sel="${esc(c.rel)}" ${on?'checked':''}></td>
         <td class="t ${c.time_src==='modified'?'mod':''}">${c.time||'<span class="muted">-</span>'}</td>
         <td><span class="fn" title="${esc(c.folder+'\n\n'+c.all.join('\n'))}">${esc(c.file)}</span>${
           c.dup?`<span class="badge dup" title="Duplicate of ${esc(c.dup)}">dup</span>`:''}</td>
@@ -553,16 +616,23 @@ function render(){
       <span class="date">${g.date}<span class="wd">${g.weekday}</span></span>
       <span class="count"></span><span class="chips"></span><span class="spacer"></span>
       <span class="sz"></span></summary>
-      <div class="tw"><table><thead><tr><th>Time</th><th>File</th><th>Device</th><th>Drive</th><th>Location</th>
+      <div class="tw"><table><thead><tr><th class="sel"><input type="checkbox" class="selall" title="Select every shown clip on this day"></th><th>Time</th><th>File</th><th>Device</th><th>Drive</th><th>Location</th>
         <th>Project</th><th class="num">Files</th><th class="num">Size</th><th></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`;
     d._clips=g.clips;
     mEl.lastElementChild.appendChild(d);
   });
-  applyFilter();
+  if(wasOpen.size)main.querySelectorAll('details').forEach(d=>d.open=wasOpen.has(d.dataset.key));
+  else if(main.firstChild)main.firstChild.open=true;
+  const opts=s=>[...s].sort((a,b)=>a.localeCompare(b)).map(v=>`<option value="${esc(v)}">`).join('');
+  document.getElementById('pjlist').innerHTML=opts(pjs);
+  document.getElementById('loclist').innerHTML=opts(locs);
+  for(const r of [...SEL])if(!CLIPS[r])SEL.delete(r);
+  applyFilter();updateSel();
+  window.scrollTo(0,scroll);
 }
-function section(cls,label){
-  const s=document.createElement('details');s.className='grp '+cls;
+function section(cls,label,key){
+  const s=document.createElement('details');s.className='grp '+cls;s.dataset.key=key;
   s.innerHTML=`<summary><span class="caret">&#9654;</span><span class="date">${esc(label)}</span>
     <span class="count"></span><span class="spacer"></span><span class="sz"></span></summary><div class="kids"></div>`;
   return s;
@@ -593,11 +663,67 @@ function applyFilter(){
     grp.querySelector(':scope>summary .sz').textContent=fmt(sz);
     if(q) grp.open=n>0;
   });
+  updateSel();
   document.getElementById('stats').innerHTML=[['Dates',dates],['Clips',clips],['Video files',vfiles],['Total',fmt(bytes)]]
     .map(([k,v])=>`<div class="stat"><b>${v}</b><span>${k}</span></div>`).join('');
 }
-function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';
+function toast(msg,ok){const t=document.getElementById('toast');t.textContent=msg;t.className=ok?'ok':'';t.style.display='block';
   clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',6000)}
+// ---- multi-select and bulk edit ----
+const shownBoxes=root=>[...root.querySelectorAll('tbody tr:not(.hide) input[data-sel]')].filter(b=>b.offsetParent);
+function setSel(box,on){box.checked=on;box.closest('tr').classList.toggle('on',on);
+  if(on)SEL.add(box.dataset.sel);else SEL.delete(box.dataset.sel)}
+function updateSel(){
+  const files=[...SEL].reduce((n,r)=>n+(CLIPS[r]?CLIPS[r].rels.length:0),0);
+  document.body.classList.toggle('selecting',SEL.size>0);
+  document.getElementById('selcount').textContent=SEL.size+' clip'+(SEL.size===1?'':'s')+' ('+files+' files)';
+  document.querySelectorAll('.day').forEach(day=>{
+    const all=day.querySelector('.selall'),boxes=[...day.querySelectorAll('tbody tr:not(.hide) input[data-sel]')];
+    const n=boxes.filter(b=>b.checked).length;
+    all.checked=n>0&&n===boxes.length;all.indeterminate=n>0&&n<boxes.length;
+  });
+}
+document.getElementById('main').addEventListener('click',e=>{
+  const box=e.target.closest('input[data-sel]'),all=e.target.closest('input.selall');
+  if(box){
+    // Shift-click selects the range of visible clips since the last click.
+    const vis=shownBoxes(document),a=vis.indexOf(LAST),b=vis.indexOf(box);
+    if(e.shiftKey&&a>=0&&b>=0)vis.slice(Math.min(a,b),Math.max(a,b)+1).forEach(x=>setSel(x,box.checked));
+    else setSel(box,box.checked);
+    LAST=box;updateSel();
+  }else if(all){
+    all.closest('table').querySelectorAll('tbody tr:not(.hide) input[data-sel]').forEach(x=>setSel(x,all.checked));
+    updateSel();
+  }
+});
+for(const [chk,inp] of [['setpj','pj'],['setloc','loc']]){
+  const c=document.getElementById(chk),i=document.getElementById(inp);
+  c.onchange=()=>{i.disabled=!c.checked;if(c.checked)i.focus()};
+}
+function clearSel(){
+  document.querySelectorAll('input[data-sel]:checked').forEach(b=>setSel(b,false));
+  SEL.clear();LAST=null;updateSel();
+}
+document.getElementById('selnone').onclick=clearSel;
+document.getElementById('apply').onclick=async()=>{
+  const body={rels:[...SEL].flatMap(r=>CLIPS[r]?CLIPS[r].rels:[])};
+  if(document.getElementById('setpj').checked)body.project=document.getElementById('pj').value;
+  if(document.getElementById('setloc').checked)body.location=document.getElementById('loc').value;
+  if(!('project' in body)&&!('location' in body))return toast('Tick Project and/or Location to change.');
+  const what=['project','location'].filter(k=>k in body)
+    .map(k=>body[k].trim()?`${k} to "${body[k].trim()}"`:`clear ${k}`).join(' and ');
+  if(!confirm(`Set ${what} on ${SEL.size} clip${SEL.size===1?'':'s'}?`))return;
+  let j;
+  try{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
+    body:JSON.stringify(body)});j=await r.json()}
+  catch(e){j={ok:false,error:'The browser script stopped responding.'}}
+  if(!j.ok)return toast(j.error||'Could not save.');
+  const n=SEL.size;clearSel();
+  for(const [chk,inp] of [['setpj','pj'],['setloc','loc']]){
+    document.getElementById(chk).checked=false;const i=document.getElementById(inp);i.value='';i.disabled=true}
+  await load();
+  toast(`Updated ${n} clip${n===1?'':'s'} (${j.updated} files).`,true);
+};
 document.getElementById('main').addEventListener('click',async e=>{
   const b=e.target.closest('button[data-rel]');if(!b)return;
   e.preventDefault();
@@ -763,7 +889,8 @@ class Handler(BaseHTTPRequestHandler):
         # The custom header forces a CORS preflight, so other websites open in
         # your browser can't trigger file opens on this local server.
         path = urlparse(self.path).path
-        if path not in ("/api/open", "/api/preview") or self.headers.get("X-Video-Browser") != "1":
+        if (path not in ("/api/open", "/api/preview", "/api/update")
+                or self.headers.get("X-Video-Browser") != "1"):
             self.send_error(403)
             return
         try:
@@ -772,6 +899,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/preview":
                 cands = req.get("cands") if isinstance(req.get("cands"), list) else []
                 self._json(prepare_preview(cands, bool(req.get("hevc")), bool(req.get("force"))))
+            elif path == "/api/update":
+                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
+                changes = {k: req[k] for k in EDITABLE if k in req}
+                self._json(update_clips(rels[:20000], changes))
             else:
                 mode = "play" if req.get("mode") == "play" else "folder"
                 self._json(open_file(str(req.get("rel", "")), mode))
