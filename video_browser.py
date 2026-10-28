@@ -113,7 +113,7 @@ CACHE_DIR = os.environ.get("VB_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "VideoBrowser", "previews")
 CACHE_MAX_BYTES = 20 * 1024**3          # oldest previews are pruned beyond 20 GB
 MAX_JOBS = 2                            # concurrent ffmpeg conversions
-MAX_UPDATE_FILES = 20000                # maximum files in a single catalog update
+MAX_UPDATE_FILES = 2000                 # maximum files in a single catalog update
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0   # no console pop-ups
