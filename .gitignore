@@ -3,6 +3,7 @@
 *.duckdb.wal
 *.wal
 .env
+video-browser-settings.json
 
 # Preview cache and placeholder mount
 previews/

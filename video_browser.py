@@ -57,15 +57,63 @@ def _pairs(var):
 # Friendly names for storage roots, e.g. VB_ROOT_LABELS="H:/=H: Processed;F:/=F: Raw"
 ROOT_LABELS = dict(_pairs("VB_ROOT_LABELS"))
 
-# Catalog paths are Windows drive paths; in a container they're mounted elsewhere.
-# VB_PATH_MAP="H:/=/media/1;F:/=/media/2"
-PATH_MAP = _pairs("VB_PATH_MAP")
+# Saved mappings override the initial environment configuration.
+SETTINGS_PATH = os.environ.get("VB_SETTINGS") or os.path.join(os.path.dirname(DB_PATH), "video-browser-settings.json")
+_settings_lock = threading.Lock()
+
+
+def load_path_map():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            settings = json.load(fh)
+        return validate_path_map(settings["path_map"])
+    except FileNotFoundError:
+        return _pairs("VB_PATH_MAP")
+
+
+def validate_path_map(mappings):
+    if not isinstance(mappings, list) or len(mappings) > 100:
+        raise ValueError("Expected a list of at most 100 drive mappings.")
+    result, seen = [], set()
+    for item in mappings:
+        if not isinstance(item, (list, tuple)) or len(item) != 2 or not all(isinstance(x, str) for x in item):
+            raise ValueError("Each mapping needs a catalog root and a mounted path.")
+        src, dst = (x.strip().replace("\\", "/") for x in item)
+        if not src or not dst or not (os.path.isabs(dst) or re.match(r"^[A-Za-z]:/", dst)):
+            raise ValueError("Each mapping needs a catalog root and an absolute mounted path.")
+        src = src.rstrip("/") + "/"
+        if src.upper() in seen:
+            raise ValueError("Each catalog root can only be mapped once.")
+        seen.add(src.upper())
+        result.append((src, dst))
+    return sorted(result, key=lambda x: len(x[0]), reverse=True)
+
+
+PATH_MAP = load_path_map()
+
+
+def save_path_map(mappings):
+    global PATH_MAP
+    mappings = validate_path_map(mappings)
+    with _settings_lock:
+        directory = os.path.dirname(os.path.abspath(SETTINGS_PATH))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".video-browser-settings-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"path_map": mappings}, fh, indent=2)
+            os.replace(tmp, SETTINGS_PATH)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        PATH_MAP = mappings
 
 # Preview cache lives outside synced folders (OneDrive, Dropbox...) by default.
 CACHE_DIR = os.environ.get("VB_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "VideoBrowser", "previews")
 CACHE_MAX_BYTES = 20 * 1024**3          # oldest previews are pruned beyond 20 GB
 MAX_JOBS = 2                            # concurrent ffmpeg conversions
+MAX_UPDATE_FILES = 2000                 # maximum files in a single catalog update
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0   # no console pop-ups
@@ -74,7 +122,7 @@ NEVER_PREVIEW = {".nev", ".gyro"}       # N-RAW and gyro data can't be decoded
 
 FILES_SQL = """
 SELECT filename, ext, kind, device, capture_date, size_bytes, modified,
-       rel_path, location, project, collection, storage_root, nas_path, dup_of
+       rel_path, full_path, location, project, collection, storage_root, nas_path, dup_of
 FROM videos
 ORDER BY capture_date DESC NULLS LAST, rel_path
 """
@@ -122,7 +170,7 @@ def preview_candidates(files):
         if (f["ext"] or "").lower() in NEVER_PREVIEW:
             return None
         return {"proxy": 0, "sidecar": 1, "video": 2}.get(f["kind"])
-    ranked = [(rank(f), f["size_bytes"] or 0, f["rel_path"]) for f in files]
+    ranked = [(rank(f), f["size_bytes"] or 0, f["full_path"]) for f in files if f["full_path"]]
     return [rel for r, _, rel in sorted(x for x in ranked if x[0] is not None)]
 
 
@@ -153,7 +201,10 @@ def load_projects(con):
 
 def load_data():
     with db() as con:
-        cur = con.execute(FILES_SQL)
+        columns = {row[1] for row in con.execute("PRAGMA table_info('videos')").fetchall()}
+        marker = "COALESCE(marked_for_deletion, FALSE)" if "marked_for_deletion" in columns else "FALSE"
+        favorite = "COALESCE(favorite, FALSE)" if "favorite" in columns else "FALSE"
+        cur = con.execute(FILES_SQL.replace("FROM videos", f", {marker} AS marked_for_deletion, {favorite} AS favorite FROM videos"))
         cols = [d[0] for d in cur.description]
         files = [dict(zip(cols, r)) for r in cur.fetchall()]
         projects = load_projects(con)
@@ -183,8 +234,13 @@ def load_data():
         g["clips"].append({
             "time": t, "time_src": tsrc, "device": device or "", "root": root,
             "collection": primary["collection"], "location": loc, "project": proj,
-            "file": primary["filename"], "rel": primary["rel_path"],
-            "rels": [f["rel_path"] for f in fs],
+            "file": primary["filename"], "rel": primary["full_path"], "path": primary["full_path"],
+            "rels": [f["full_path"] for f in fs if f["full_path"]],
+            "file_details": [{"rel": f["full_path"], "name": f["filename"],
+                              "kind": f["kind"], "path": f["full_path"], "marked": f["marked_for_deletion"]}
+                             for f in sorted(fs, key=lambda f: f["rel_path"])],
+            "marked_count": sum(bool(f["marked_for_deletion"]) for f in fs),
+            "favorite": any(f["favorite"] for f in fs),
             "folder": os.path.dirname(primary["rel_path"] or ""),
             "files": len(fs), "video_files": len(videos),
             "all": sorted(f["filename"] + ("" if f["kind"] == "video" else f"  ({f['kind']})")
@@ -215,7 +271,7 @@ def load_data():
 
 def lookup_path(rel):
     with db() as con:
-        row = con.execute("SELECT full_path FROM videos WHERE rel_path = ?", [rel]).fetchone()
+        row = con.execute("SELECT full_path FROM videos WHERE full_path = ?", [rel]).fetchone()
     return local_path(row[0]) if row else None
 
 
@@ -225,9 +281,9 @@ def lookup_paths(rels):
         return {}
     with db() as con:
         rows = con.execute(
-            f"SELECT rel_path, full_path FROM videos WHERE rel_path IN ({','.join('?' * len(rels))})",
+            f"SELECT full_path FROM videos WHERE full_path IN ({','.join('?' * len(rels))})",
             rels).fetchall()
-    return {rel: local_path(full) for rel, full in rows}
+    return {full: local_path(full) for (full,) in rows}
 
 
 EDITABLE = ("project", "location")
@@ -248,8 +304,30 @@ def update_clips(rels, changes):
         return {"ok": False, "error": "Tick Project and/or Location to change."}
     try:
         with db(read_only=False) as con:
-            n = con.execute(f"UPDATE videos SET {', '.join(sets)} WHERE list_contains(?, rel_path)",
+            n = con.execute(f"UPDATE videos SET {', '.join(sets)} WHERE list_contains(?, full_path)",
                             args + [rels]).fetchone()[0]
+    except duckdb.Error as e:
+        return {"ok": False, "error": "Couldn't save - the catalog may be open in another program "
+                f"or mounted read-only.\n{e}"}
+    return {"ok": True, "updated": n}
+
+
+def mark_files(rels, marked, column="marked_for_deletion"):
+    """Mark catalog rows without modifying the media files."""
+    rels = sorted({r for r in rels if isinstance(r, str) and r})
+    if not rels or not isinstance(marked, bool) or column not in ("marked_for_deletion", "favorite"):
+        return {"ok": False, "error": "Select files and choose a valid marker."}
+    try:
+        with db(read_only=False) as con:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {column} BOOLEAN DEFAULT FALSE")
+                n = con.execute(f"UPDATE videos SET {column} = ? WHERE list_contains(?, full_path)",
+                                [marked, rels]).fetchone()[0]
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
     except duckdb.Error as e:
         return {"ok": False, "error": "Couldn't save - the catalog may be open in another program "
                 f"or mounted read-only.\n{e}"}
@@ -409,19 +487,26 @@ PAGE = r"""<!doctype html>
 <title>Video Catalog</title>
 <style>
   :root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--txt:#e6e9ef;
-    --muted:#98a2b3;--accent:#6ea8fe;--chip:#242a35;--ok:#4cc38a;--warn:#f0b44c;--bad:#f07171}
+    --muted:#a5afbf;--accent:#80b3ff;--chip:#242a35;--ok:#4cc38a;--warn:#f0b44c;--bad:#f07171;
+    --content-width:1324px;--gutter:22px}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--txt);
     font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-  header{position:sticky;top:0;z-index:5;background:#12151bee;border-bottom:1px solid var(--line);
-    padding:16px 22px;backdrop-filter:blur(6px)}
-  h1{margin:0 0 4px;font-size:18px;font-weight:650}
+  ::selection{background:#365883;color:#fff}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  header{position:sticky;top:0;z-index:5;background:#12151b;border-bottom:1px solid var(--line)}
+  .content-width{width:100%;max-width:var(--content-width);margin-inline:auto;padding-inline:var(--gutter)}
+  .header-inner{padding-block:20px 16px}
+  h1{margin:0 0 5px;font-size:20px;line-height:1.25;font-weight:650;letter-spacing:-.02em}
   .sub{color:var(--muted);font-size:12.5px}
-  .stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px}
-  .stat b{font-size:17px;font-variant-numeric:tabular-nums}.stat span{color:var(--muted);font-size:12px;margin-left:5px}
-  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  .stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px}
+  .stat{display:flex;align-items:baseline;gap:6px}
+  .stat b{font-size:17px;line-height:1;font-variant-numeric:tabular-nums}.stat span{color:var(--muted);font-size:12px}
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}
+  .toolbar label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12.5px;white-space:nowrap}
   input[type=search]{flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--line);
-    color:var(--txt);border-radius:9px;padding:9px 12px;font-size:13.5px;outline:none}
+    color:var(--txt);border-radius:9px;padding:9px 12px;font-size:13.5px}
+  input[type=search]::placeholder{color:#a5afbf}
   input[type=search]:focus{border-color:var(--accent)}
   button{background:var(--chip);border:1px solid var(--line);color:var(--txt);
     border-radius:9px;padding:8px 12px;font-size:12.5px;cursor:pointer}
@@ -432,17 +517,18 @@ PAGE = r"""<!doctype html>
   .seg button.on{background:#25344f;color:#cfe0ff}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
   .dot.on{background:var(--ok)}.dot.off{background:var(--muted);opacity:.5}
-  main{padding:16px 22px 60px;max-width:1280px}
-  .grp>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:14px;padding:10px 6px;border-radius:9px}
+  main{padding-block:24px 60px}
+  .grp>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:14px;padding:11px 10px;border-radius:9px}
   .grp>summary::-webkit-details-marker{display:none}
   .grp>summary:hover{background:var(--panel2)}
-  .grp.yr{margin-bottom:6px}
+  .grp.yr{margin-bottom:8px}
+  .grp.yr>summary{border-bottom:1px solid var(--line);border-radius:0}
   .grp.yr>summary .date{font-size:17px;font-weight:700}
   .grp.mo{margin-left:18px}
   .grp.mo>summary .date{font-weight:600}
-  .grp>.kids{padding:2px 0 8px}
+  .grp>.kids{padding:6px 0 10px}
   .grp.mo>.kids{margin-left:18px}
-  .day{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden;background:var(--panel)}
+  .day{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;overflow:hidden;background:var(--panel)}
   .day>summary{list-style:none;cursor:pointer;padding:13px 16px;display:flex;align-items:center;gap:14px}
   .day>summary::-webkit-details-marker{display:none}
   .day>summary:hover{background:var(--panel2)}
@@ -473,10 +559,10 @@ PAGE = r"""<!doctype html>
   .badge{font-size:10.5px;border-radius:5px;padding:1px 6px;margin-left:6px;white-space:nowrap}
   .badge.nas{color:var(--ok);border:1px solid #2c5a45}
   .badge.nonas{color:var(--warn);border:1px solid #6a5426}
-  .badge.dup{color:var(--bad);border:1px solid #6a3030}
+  .badge.dup,.badge.marked{color:var(--bad);border:1px solid #6a3030}
   .drv{color:var(--muted);font-size:12px;white-space:nowrap}
   .act{display:flex;gap:6px;justify-content:flex-end}
-  .act button{padding:4px 8px;font-size:12px;line-height:1}
+  .act button{padding:4px 8px;font-size:12px;line-height:1;white-space:nowrap}
   .muted{color:var(--muted)}
   .hide{display:none!important}
   .empty{color:var(--muted);padding:30px;text-align:center}
@@ -494,10 +580,17 @@ PAGE = r"""<!doctype html>
   body.selecting main{padding-bottom:130px}
   #selbar label{color:var(--muted);font-size:12.5px;display:flex;align-items:center;gap:5px;white-space:nowrap}
   #selbar input[type=text]{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;
-    padding:6px 9px;font-size:13px;width:170px;outline:none}
+    padding:6px 9px;font-size:13px;width:170px}
   #selbar input[type=text]:focus{border-color:var(--accent)}
   #selbar input[type=text]:disabled{opacity:.4}
   #selbar button.go{background:#25344f;border-color:#36507a;color:#cfe0ff}
+  #apply-confirm{position:fixed;inset:auto 16px var(--confirm-bottom,100px);margin:0 auto;
+    color:var(--txt);background:var(--panel);border:1px solid #36507a;border-radius:12px;
+    padding:16px;width:min(420px,calc(100% - 32px));box-shadow:0 10px 40px #000a}
+  #apply-confirm::backdrop{background:#05070b99}
+  #apply-confirm p{margin:0 0 14px;overflow-wrap:anywhere}
+  #apply-confirm .actions{display:flex;justify-content:flex-end;gap:8px}
+  .act button.favorite-on{color:#f4cf76;border-color:#806b3f;background:#39301f}
   .act button.pv{color:#cfe0ff;border-color:#36507a;background:#1f2b40}
   .act button:disabled{opacity:.35;cursor:not-allowed;border-color:var(--line)}
   #pv{position:fixed;inset:0;background:#05070bdd;z-index:30;display:none;align-items:center;justify-content:center;padding:24px}
@@ -513,32 +606,80 @@ PAGE = r"""<!doctype html>
     gap:12px;color:var(--muted);text-align:center;padding:30px;white-space:pre-line}
   #pv .msg.err{color:#ffd7d7}
   #pv .prog{width:260px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
-  #pv .prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}
+  #pv .prog i{display:block;height:100%;width:0;background:var(--accent)}
   #pv .nav{display:flex;gap:6px}
-  footer{color:var(--muted);font-size:11.5px;padding:0 22px 40px}
+  #settings{color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    width:min(720px,calc(100% - 32px));max-height:85vh;overflow:auto;padding:22px}
+  #settings::backdrop{background:#05070bdd}
+  #settings h2{margin:0 0 8px;font-size:18px}
+  #settings p{color:var(--muted)}
+  #settings .mapping{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+  #settings label{color:var(--muted);font-size:12px}
+  #settings input{display:block;width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--line);
+    color:var(--txt);border-radius:8px;padding:8px;font-size:13px}
+  #settings .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+  #settings-error{color:var(--bad);white-space:pre-line}
+  @media(max-width:550px){#settings .mapping{grid-template-columns:1fr}}
+  #files-dialog{color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    width:min(720px,calc(100% - 32px));max-height:85vh;overflow:auto;padding:22px}
+  #files-dialog::backdrop{background:#05070bdd}
+  #files-dialog h2{margin:0 0 8px;font-size:18px}
+  #files-dialog p{color:var(--muted)}
+  #file-list .file-row{display:flex;align-items:center;gap:8px;padding:8px 0}
+  #file-list label{display:flex;align-items:center;gap:8px;flex:1;min-width:0;overflow-wrap:anywhere}
+  #file-list .fn{white-space:normal}
+  #files-dialog .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  footer{color:var(--muted);font-size:11.5px;padding-bottom:40px}
   code{background:var(--panel2);padding:1px 6px;border-radius:5px}
 </style></head>
 <body>
 <header>
+ <div class="content-width header-inner">
   <h1>Video Catalog <span class="sub">- normalized, collapsed by date</span></h1>
   <div class="sub" id="dbline"></div>
   <div class="stats" id="stats"></div>
   <div class="toolbar">
     <span class="seg" id="roots"></span>
-    <input id="q" type="search" placeholder="Filter by date, file, device, location, project...">
+    <input id="q" type="search" aria-label="Filter catalog" placeholder="Filter by date, file, device, location, project...">
+    <label><input type="checkbox" id="marked-only"> Marked for deletion only</label>
+    <label><input type="checkbox" id="favorites-only"> Favorites only</label>
     <button id="expand">Expand all</button>
     <button id="collapse">Collapse all</button>
     <button id="reload">&#8635; Reload</button>
+    <button id="settings-open">Drive settings</button>
   </div>
+ </div>
 </header>
-<main id="main"><div class="empty">Loading...</div></main>
+<main id="main" class="content-width"><div class="empty">Loading...</div></main>
 <div id="toast"></div>
+<dialog id="apply-confirm" aria-labelledby="apply-confirm-message">
+  <form method="dialog">
+    <p id="apply-confirm-message"></p>
+    <div class="actions"><button value="cancel" autofocus>Cancel</button><button value="confirm">Confirm</button></div>
+  </form>
+</dialog>
+<dialog id="settings" aria-labelledby="settings-title">
+  <form id="settings-form">
+    <h2 id="settings-title">Drive mappings</h2>
+    <p>Choose where each catalog drive is mounted on this server. Leave a mounted path blank to remove its mapping.</p>
+    <p>In Docker, use container paths such as <code>/media/1</code>. If Windows assigns a different drive letter, update <code>MEDIA_1</code> or <code>MEDIA_2</code> in <code>.env</code> and recreate the container; this screen cannot change Docker mounts.</p>
+    <div id="mappings"></div><div id="settings-error" role="alert"></div>
+    <div class="actions"><button type="button" id="settings-cancel">Cancel</button><button type="submit">Save mappings</button></div>
+  </form>
+</dialog>
+<dialog id="files-dialog" aria-labelledby="files-title">
+  <h2 id="files-title">Clip files</h2>
+  <p>Select files to mark or unmark. This only changes the catalog; files are not deleted.</p>
+  <div id="file-list"></div>
+  <div class="actions"><button id="files-mark">Mark selected for deletion</button>
+    <button id="files-unmark">Unmark selected</button><button id="files-close">Close</button></div>
+</dialog>
 <div id="selbar"><b id="selcount"></b>
   <label><input type="checkbox" id="setpj"> Project</label>
   <input type="text" id="pj" list="pjlist" placeholder="blank clears it" disabled>
   <label><input type="checkbox" id="setloc"> Location</label>
   <input type="text" id="loc" list="loclist" placeholder="blank clears it" disabled>
-  <button class="go" id="apply">Apply</button><button id="selnone">Clear selection</button></div>
+  <button class="go" id="apply">Apply</button><button id="mark-selected">Mark for deletion</button><button id="unmark-selected">Unmark</button><button id="selnone">Clear selection</button></div>
 <datalist id="pjlist"></datalist><datalist id="loclist"></datalist>
 <div id="pv"><div class="box">
   <div class="bar"><span class="ttl">Preview <span class="fn" id="pvname"></span></span>
@@ -550,7 +691,7 @@ PAGE = r"""<!doctype html>
   <div class="stage"><video id="pvvid" controls playsinline preload="auto"></video>
     <div class="msg" id="pvmsg"></div></div>
 </div></div>
-<footer>Data read live from the DuckDB file on each reload. Times in <i>italics</i> come from the
+<footer class="content-width">Data read live from the DuckDB file on each reload. Times in <i>italics</i> come from the
 file's modified time; the rest from the filename. Runs locally only.</footer>
 <script>
 let DATA=null, ROOT='all', CLIPS={}, LAST=null;
@@ -559,6 +700,32 @@ try{ROOT=localStorage.getItem('vb.root')||'all'}catch(e){}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=b=>{const mb=b/1048576;return mb>=1048576?(mb/1048576).toFixed(2)+' TB':mb>=1024?(mb/1024).toFixed(2)+' GB':Math.round(mb)+' MB'};
 const rootLabel=r=>(DATA.roots.find(x=>x.root===r)||{label:r}).label;
+
+document.getElementById('settings-open').onclick=async()=>{
+  const dialog=document.getElementById('settings'),error=document.getElementById('settings-error');
+  error.textContent='';
+  try{
+    const response=await fetch('/api/settings'),settings=await response.json();
+    if(!response.ok)throw new Error(settings.error||'Could not load settings.');
+    const entries=new Map(settings.path_map.map(([src,dst])=>[src,dst]));
+    if(DATA&&DATA.roots)DATA.roots.forEach(r=>{if(r.root&&!Array.from(entries.keys()).some(k=>k.toUpperCase()===r.root.replace(/\\/g,'/').replace(/\/?$/,'/').toUpperCase()))entries.set(r.root,'')});
+    document.getElementById('mappings').innerHTML=[...entries].map(([src,dst])=>
+      `<div class="mapping"><label>Catalog root<input class="map-root" value="${esc(src)}" readonly></label>`+
+      `<label>Mounted path<input class="map-path" value="${esc(dst)}" placeholder="e.g. /media/1"></label></div>`).join('') || '<p>No catalog drives found.</p>';
+    dialog.showModal();
+  }catch(e){toast(e.message||'Could not load settings.')}
+};
+document.getElementById('settings-cancel').onclick=()=>document.getElementById('settings').close();
+document.getElementById('settings-form').onsubmit=async e=>{
+  e.preventDefault();const error=document.getElementById('settings-error');error.textContent='';
+  const mappings=[...document.querySelectorAll('#mappings .mapping')].map(row=>
+    [row.querySelector('.map-root').value,row.querySelector('.map-path').value.trim()]).filter(x=>x[1]);
+  try{
+    const response=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},body:JSON.stringify({path_map:mappings})});
+    const result=await response.json();if(!response.ok||!result.ok)throw new Error(result.error||'Could not save settings.');
+    document.getElementById('settings').close();await load();toast('Drive mappings saved.',true);
+  }catch(err){error.textContent=err.message||'Could not save settings.'}
+};
 
 async function load(){
   const r=await fetch('/api/videos');DATA=await r.json();
@@ -603,13 +770,14 @@ function render(){
         <td class="sel"><input type="checkbox" data-sel="${esc(c.rel)}" ${on?'checked':''}></td>
         <td class="t ${c.time_src==='modified'?'mod':''}">${c.time||'<span class="muted">-</span>'}</td>
         <td><span class="fn" title="${esc(c.folder+'\n\n'+c.all.join('\n'))}">${esc(c.file)}</span>${
-          c.dup?`<span class="badge dup" title="Duplicate of ${esc(c.dup)}">dup</span>`:''}</td>
+          c.dup?`<span class="badge dup" title="Duplicate of ${esc(c.dup)}">dup</span>`:''}${
+          c.marked_count?`<span class="badge marked" title="${c.marked_count} of ${c.files} files marked for deletion">${c.marked_count===c.files?'marked for deletion':c.marked_count+'/'+c.files+' marked'}</span>`:''}</td>
         <td>${esc(c.device)}</td>
         <td class="drv">${esc(rootLabel(c.root))}${c.nas?'<span class="badge nas" title="Backed up to NAS">NAS</span>':'<span class="badge nonas" title="No NAS copy recorded">no NAS</span>'}</td>
         <td>${c.location?`<span class="tag">${esc(c.location)}</span>`:'<span class="muted">-</span>'}</td>
         <td>${c.project?`<span class="tag pj"${pt?` title="${esc(pt)}"`:''}>${esc(c.project)}</span>`:'<span class="muted">-</span>'}</td>
         <td class="num muted">${c.files}</td><td class="num">${fmt(c.size)}</td>
-        <td><div class="act"><button class="pv" data-pv="${g.date}|${i}" ${c.pv.length?'title="Preview in the browser"':'disabled title="Nothing previewable - N-RAW (.NEV) without a proxy"'}>&#128065;</button>
+        <td><div class="act"><button data-favorite="${esc(c.rel)}" class="${c.favorite?'favorite-on':''}" aria-pressed="${c.favorite}" title="${c.favorite?'Remove from favorites':'Add to favorites'}">${c.favorite?'★ Favorite':'☆ Favorite'}</button><button data-copy-path="${esc(c.path||'')}" ${c.path?'':'disabled'} title="Copy catalog path">Copy path</button><button data-files="${esc(c.rel)}" title="View and mark individual files">Files</button><button class="pv" data-pv="${g.date}|${i}" ${c.pv.length?'title="Preview in the browser"':'disabled title="Nothing previewable - N-RAW (.NEV) without a proxy"'}>&#128065;</button>
           <button data-rel="${esc(c.rel)}" data-mode="play" title="Open in your default player">&#9654;</button>
           <button data-rel="${esc(c.rel)}" data-mode="folder" title="Show in folder">&#128193;</button></div></td></tr>`}).join('');
     d.innerHTML=`<summary><span class="caret">&#9654;</span>
@@ -639,11 +807,13 @@ function section(cls,label,key){
 }
 function applyFilter(){
   const q=document.getElementById('q').value.trim().toLowerCase();
+  const markedOnly=document.getElementById('marked-only').checked;
+  const favoritesOnly=document.getElementById('favorites-only').checked;
   let dates=0,clips=0,vfiles=0,bytes=0;
   document.querySelectorAll('.day').forEach(day=>{
     let shown=0,sz=0;const devs=new Set();
     day.querySelectorAll('tbody tr').forEach((tr,i)=>{
-      const hit=(ROOT==='all'||tr.dataset.root===ROOT)&&(!q||tr.dataset.blob.includes(q));
+      const hit=(ROOT==='all'||tr.dataset.root===ROOT)&&(!q||tr.dataset.blob.includes(q))&&(!markedOnly||day._clips[i].marked_count>0)&&(!favoritesOnly||day._clips[i].favorite);
       tr.classList.toggle('hide',!hit);
       if(hit){shown++;sz+=+tr.dataset.size;vfiles+=+tr.dataset.vf;devs.add(day._clips[i].device)}});
     day.classList.toggle('hide',shown===0);
@@ -652,7 +822,7 @@ function applyFilter(){
     day.querySelector('.count').textContent=shown+' clip'+(shown===1?'':'s');
     day.querySelector('.chips').innerHTML=[...devs].sort().map(x=>`<span class="chip">${esc(x)}</span>`).join('');
     day.querySelector('.sz').textContent=fmt(sz);
-    if(q) day.open=shown>0;
+    if(q||markedOnly||favoritesOnly) day.open=shown>0;
   });
   document.querySelectorAll('.grp').forEach(grp=>{
     let n=0,days=0,sz=0;
@@ -661,7 +831,7 @@ function applyFilter(){
     grp.querySelector(':scope>summary .count').textContent=
       n+' clip'+(n===1?'':'s')+' · '+days+' day'+(days===1?'':'s');
     grp.querySelector(':scope>summary .sz').textContent=fmt(sz);
-    if(q) grp.open=n>0;
+    if(q||markedOnly||favoritesOnly) grp.open=n>0;
   });
   updateSel();
   document.getElementById('stats').innerHTML=[['Dates',dates],['Clips',clips],['Video files',vfiles],['Total',fmt(bytes)]]
@@ -705,6 +875,54 @@ function clearSel(){
   SEL.clear();LAST=null;updateSel();
 }
 document.getElementById('selnone').onclick=clearSel;
+async function setDeletionMark(rels,marked){
+  if(!rels.length){toast('Select at least one file.');return false}
+  try{
+    const r=await fetch('/api/mark-deletion',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
+      body:JSON.stringify({rels,marked})});
+    const j=await r.json();if(!j.ok){toast(j.error||'Could not save.');return false}
+    await load();toast(`${j.updated} file${j.updated===1?'':'s'} ${marked?'marked for deletion':'unmarked'}.`,true);return true;
+  }catch(e){toast('Could not save the deletion marker.');return false}
+}
+for(const [id,marked] of [['mark-selected',true],['unmark-selected',false]])
+  document.getElementById(id).onclick=async()=>{
+    const rels=[...SEL].flatMap(r=>CLIPS[r]?CLIPS[r].rels:[]);
+    if(await setDeletionMark(rels,marked))clearSel();
+  };
+const filesDialog=document.getElementById('files-dialog');
+document.getElementById('main').addEventListener('click',e=>{
+  const b=e.target.closest('button[data-files]');if(!b)return;
+  const c=CLIPS[b.dataset.files];if(!c)return;
+  document.getElementById('file-list').innerHTML=c.file_details.map(f=>
+    `<div class="file-row"><label><input type="checkbox" data-file-rel="${esc(f.rel)}"><span class="fn">${esc(f.name)}</span>
+      <span class="muted">${esc(f.kind||'')}</span>${f.marked?'<span class="badge marked">marked for deletion</span>':''}</label>
+      <button data-copy-path="${esc(f.path||'')}" ${f.path?'':'disabled'}>Copy path</button></div>`).join('');
+  filesDialog.showModal();
+});
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-copy-path]');if(!b)return;
+  try{
+    if(!navigator.clipboard||!navigator.clipboard.writeText)throw new Error('Clipboard unavailable');
+    await navigator.clipboard.writeText(b.dataset.copyPath);toast('Catalog path copied.',true);
+  }catch(err){toast('Could not copy the path. Check browser clipboard permissions.')}
+});
+document.getElementById('main').addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-favorite]');if(!b)return;
+  const c=CLIPS[b.dataset.favorite];if(!c)return;
+  b.disabled=true;
+  try{
+    const r=await fetch('/api/favorite',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
+      body:JSON.stringify({rels:c.rels,marked:!c.favorite})});
+    const j=await r.json();if(!j.ok){toast(j.error||'Could not save favorite.');b.disabled=false;return}
+    await load();toast(c.favorite?'Removed from favorites.':'Added to favorites.',true);
+  }catch(err){b.disabled=false;toast('Could not save favorite.')}
+});
+document.getElementById('files-close').onclick=()=>filesDialog.close();
+for(const [id,marked] of [['files-mark',true],['files-unmark',false]])
+  document.getElementById(id).onclick=async()=>{
+    const rels=[...document.querySelectorAll('#file-list input:checked')].map(b=>b.dataset.fileRel);
+    if(await setDeletionMark(rels,marked))filesDialog.close();
+  };
 document.getElementById('apply').onclick=async()=>{
   const body={rels:[...SEL].flatMap(r=>CLIPS[r]?CLIPS[r].rels:[])};
   if(document.getElementById('setpj').checked)body.project=document.getElementById('pj').value;
@@ -712,7 +930,14 @@ document.getElementById('apply').onclick=async()=>{
   if(!('project' in body)&&!('location' in body))return toast('Tick Project and/or Location to change.');
   const what=['project','location'].filter(k=>k in body)
     .map(k=>body[k].trim()?`${k} to "${body[k].trim()}"`:`clear ${k}`).join(' and ');
-  if(!confirm(`Set ${what} on ${SEL.size} clip${SEL.size===1?'':'s'}?`))return;
+  const dialog=document.getElementById('apply-confirm');
+  document.getElementById('apply-confirm-message').textContent=`Set ${what} on ${SEL.size} clip${SEL.size===1?'':'s'}?`;
+  dialog.style.setProperty('--confirm-bottom',`${Math.max(18,window.innerHeight-document.getElementById('selbar').getBoundingClientRect().top+10)}px`);
+  const confirmed=await new Promise(resolve=>{
+    dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true});
+    dialog.returnValue='';dialog.showModal();
+  });
+  if(!confirmed)return;
   let j;
   try{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
     body:JSON.stringify(body)});j=await r.json()}
@@ -792,6 +1017,8 @@ document.getElementById('main').addEventListener('click',e=>{
 });
 document.getElementById('q').addEventListener('input',applyFilter);
 // Expand opens years and months only, so the result is an outline of days rather than every clip.
+document.getElementById('marked-only').onchange=applyFilter;
+document.getElementById('favorites-only').onchange=applyFilter;
 document.getElementById('expand').onclick=()=>document.querySelectorAll('.grp:not(.hide)').forEach(d=>d.open=true);
 document.getElementById('collapse').onclick=()=>document.querySelectorAll('.grp,.day').forEach(d=>d.open=false);
 document.getElementById('reload').onclick=load;
@@ -858,6 +1085,8 @@ class Handler(BaseHTTPRequestHandler):
             path = u.path
             if path == "/api/videos":
                 self._json(load_data())
+            elif path == "/api/settings":
+                self._json({"path_map": PATH_MAP})
             elif path in ("/", "/index.html"):
                 self._send(PAGE.encode(), "text/html; charset=utf-8")
             elif path == "/media":
@@ -889,20 +1118,34 @@ class Handler(BaseHTTPRequestHandler):
         # The custom header forces a CORS preflight, so other websites open in
         # your browser can't trigger file opens on this local server.
         path = urlparse(self.path).path
-        if (path not in ("/api/open", "/api/preview", "/api/update")
+        if (path not in ("/api/open", "/api/preview", "/api/update", "/api/settings", "/api/mark-deletion", "/api/favorite")
                 or self.headers.get("X-Video-Browser") != "1"):
             self.send_error(403)
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(n) or b"{}")
-            if path == "/api/preview":
+            if path in ("/api/mark-deletion", "/api/favorite", "/api/update"):
+                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
+                if len(rels) > MAX_UPDATE_FILES:
+                    return self._json({"ok": False, "error":
+                        f"Select at most {MAX_UPDATE_FILES:,} files at a time; no changes were made."}, 400)
+            if path == "/api/settings":
+                try:
+                    save_path_map(req.get("path_map"))
+                    self._json({"ok": True})
+                except (ValueError, OSError) as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+            elif path == "/api/preview":
                 cands = req.get("cands") if isinstance(req.get("cands"), list) else []
                 self._json(prepare_preview(cands, bool(req.get("hevc")), bool(req.get("force"))))
+            elif path == "/api/mark-deletion":
+                self._json(mark_files(rels, req.get("marked")))
+            elif path == "/api/favorite":
+                self._json(mark_files(rels, req.get("marked"), "favorite"))
             elif path == "/api/update":
-                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
                 changes = {k: req[k] for k in EDITABLE if k in req}
-                self._json(update_clips(rels[:20000], changes))
+                self._json(update_clips(rels, changes))
             else:
                 mode = "play" if req.get("mode") == "play" else "folder"
                 self._json(open_file(str(req.get("rel", "")), mode))

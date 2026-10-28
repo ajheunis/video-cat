@@ -17,6 +17,14 @@ play with ffmpeg.
 - Bulk edit: tick clips (shift-click for a range, or the header box for a
   whole day) and set or clear their Project and/or Location. Changes are
   written to every file of each clip in the catalog.
+- Copy a clip’s original catalog path, or use **Files** to copy a related file’s path.
+- Mark a clip as a favorite and use **Favorites only** to filter the catalog.
+  Favorites are stored on all files in the clip; the app adds the `favorite`
+  Boolean column on first use if needed.
+- Mark selected clips for deletion, or use **Files** to mark individual files.
+  Marked files remain in the catalog and on disk; you can unmark them at any time.
+  Use **Marked for deletion only** to show clips with at least one marked file.
+  The app adds the `marked_for_deletion` Boolean column on first use if needed.
 
 The data is read live from the DuckDB file on every request. Connections are
 short-lived, so the file is only locked while a request runs; if another
@@ -46,6 +54,18 @@ Open <http://127.0.0.1:8000>.
 Mounted drives must be connected when the container starts. In the container,
 the **Play** and **Show in folder** buttons are unavailable; use the preview.
 
+Use **Drive settings** in the app to change which container mount corresponds
+to each catalog root. Saving applies the mappings immediately and stores them
+in `video-browser-settings.json` in `CATALOG_DIR`, so they persist when the
+container is recreated. The saved mappings take precedence over `VB_PATH_MAP`;
+that environment variable supplies the initial mappings before the first save.
+To reset to the environment defaults, stop the app and remove the settings file.
+
+The settings screen cannot change Docker's host mounts. If the SSDs receive
+different Windows drive letters, update `MEDIA_1` and `MEDIA_2` in `.env` to
+the current letters, then run `docker compose up -d --force-recreate` with the
+drives connected. Alternatively, assign persistent drive letters in Windows.
+
 ## Run directly (Windows, macOS, Linux)
 
 ```bash
@@ -57,6 +77,8 @@ Put `videos_catalog.duckdb` next to the script or one folder up, or set
 `VB_DB`. Install ffmpeg/ffprobe on `PATH` for converted previews
 (Windows: `winget install Gyan.FFmpeg`). Other settings: `VB_HOST`, `VB_PORT`,
 `VB_CACHE`, `VB_ROOT_LABELS`, `VB_PATH_MAP`.
+Saved drive mappings live next to the catalog by default; set `VB_SETTINGS` to
+choose a different settings file.
 
 ## Catalog schema
 
@@ -71,14 +93,16 @@ The app expects a DuckDB 2 database with a `videos` table:
 | `capture_date` | DATE      |                                             |
 | `size_bytes`   | BIGINT    |                                             |
 | `modified`     | TIMESTAMP | file modified time                          |
-| `rel_path`     | VARCHAR   | unique path relative to the storage root    |
-| `full_path`    | VARCHAR   | absolute path, e.g. `H:/Processed/...`      |
+| `rel_path`     | VARCHAR   | path relative to the storage root           |
+| `full_path`    | VARCHAR   | unique absolute path, e.g. `H:/Processed/...` |
 | `location`     | VARCHAR   | optional                                    |
 | `project`      | VARCHAR   | optional                                    |
 | `collection`   | VARCHAR   | e.g. `Processed`, `Raw`                     |
 | `storage_root` | VARCHAR   | e.g. `H:/`                                  |
 | `nas_path`     | VARCHAR   | set when a NAS backup exists                |
 | `dup_of`       | VARCHAR   | set when the file duplicates another        |
+| `marked_for_deletion` | BOOLEAN | optional; true marks a file for deletion |
+| `favorite`     | BOOLEAN   | optional; true marks a file as a favorite |
 
 An optional `projects` table (`project`, `resolve_project`, `editing_media`,
 `notes`) adds hover notes to project tags.
@@ -86,7 +110,7 @@ An optional `projects` table (`project`, `resolve_project`, `editing_media`,
 ## Security
 
 There is no authentication. Anyone who can reach the port can browse the
-catalog, stream any file in it, and edit project/location values. Keep it bound to `127.0.0.1` (the default,
+catalog, stream any file in it, and edit project/location values, favorites, and deletion markers. Keep it bound to `127.0.0.1` (the default,
 and what `compose.yaml` does). POST endpoints require a custom header and
 media requests reject cross-site fetches, so other websites can't drive it.
 
