@@ -583,6 +583,12 @@ PAGE = r"""<!doctype html>
   #selbar input[type=text]:focus{border-color:var(--accent)}
   #selbar input[type=text]:disabled{opacity:.4}
   #selbar button.go{background:#25344f;border-color:#36507a;color:#cfe0ff}
+  #apply-confirm{position:fixed;inset:auto 16px var(--confirm-bottom,100px);margin:0 auto;
+    color:var(--txt);background:var(--panel);border:1px solid #36507a;border-radius:12px;
+    padding:16px;width:min(420px,calc(100% - 32px));box-shadow:0 10px 40px #000a}
+  #apply-confirm::backdrop{background:#05070b99}
+  #apply-confirm p{margin:0 0 14px;overflow-wrap:anywhere}
+  #apply-confirm .actions{display:flex;justify-content:flex-end;gap:8px}
   .act button.favorite-on{color:#f4cf76;border-color:#806b3f;background:#39301f}
   .act button.pv{color:#cfe0ff;border-color:#36507a;background:#1f2b40}
   .act button:disabled{opacity:.35;cursor:not-allowed;border-color:var(--line)}
@@ -645,6 +651,12 @@ PAGE = r"""<!doctype html>
 </header>
 <main id="main" class="content-width"><div class="empty">Loading...</div></main>
 <div id="toast"></div>
+<dialog id="apply-confirm" aria-labelledby="apply-confirm-message">
+  <form method="dialog">
+    <p id="apply-confirm-message"></p>
+    <div class="actions"><button value="cancel" autofocus>Cancel</button><button value="confirm">Confirm</button></div>
+  </form>
+</dialog>
 <dialog id="settings" aria-labelledby="settings-title">
   <form id="settings-form">
     <h2 id="settings-title">Drive mappings</h2>
@@ -917,7 +929,14 @@ document.getElementById('apply').onclick=async()=>{
   if(!('project' in body)&&!('location' in body))return toast('Tick Project and/or Location to change.');
   const what=['project','location'].filter(k=>k in body)
     .map(k=>body[k].trim()?`${k} to "${body[k].trim()}"`:`clear ${k}`).join(' and ');
-  if(!confirm(`Set ${what} on ${SEL.size} clip${SEL.size===1?'':'s'}?`))return;
+  const dialog=document.getElementById('apply-confirm');
+  document.getElementById('apply-confirm-message').textContent=`Set ${what} on ${SEL.size} clip${SEL.size===1?'':'s'}?`;
+  dialog.style.setProperty('--confirm-bottom',`${Math.max(18,window.innerHeight-document.getElementById('selbar').getBoundingClientRect().top+10)}px`);
+  const confirmed=await new Promise(resolve=>{
+    dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true});
+    dialog.returnValue='';dialog.showModal();
+  });
+  if(!confirmed)return;
   let j;
   try{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-Video-Browser':'1'},
     body:JSON.stringify(body)});j=await r.json()}
