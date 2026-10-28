@@ -1,10 +1,50 @@
 import datetime
+import http.client
+import json
 import os
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 import duckdb
 import video_browser as browser
+
+
+class BulkRequestLimitTests(unittest.TestCase):
+    def test_update_endpoints_reject_oversized_requests_without_changes(self):
+        server = browser.ThreadingHTTPServer(("127.0.0.1", 0), browser.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(browser, "mark_files") as mark, patch.object(browser, "update_clips") as update:
+                mark.return_value = update.return_value = {"ok": True, "updated": 1}
+                for endpoint in ("/api/mark-deletion", "/api/favorite", "/api/update"):
+                    for count in (browser.MAX_UPDATE_FILES, browser.MAX_UPDATE_FILES + 1):
+                        with self.subTest(endpoint=endpoint, count=count):
+                            mark.reset_mock()
+                            update.reset_mock()
+                            conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                            body = json.dumps({"rels": ["F:/clip.mp4"] * count, "marked": True, "location": "Home"})
+                            conn.request("POST", endpoint, body, {"Content-Type": "application/json", "X-Video-Browser": "1"})
+                            response = conn.getresponse()
+                            result = json.loads(response.read())
+                            conn.close()
+                            if count > browser.MAX_UPDATE_FILES:
+                                self.assertEqual(response.status, 400)
+                                self.assertFalse(result["ok"])
+                                self.assertIn("no changes were made", result["error"])
+                                mark.assert_not_called()
+                                update.assert_not_called()
+                            else:
+                                self.assertEqual(response.status, 200)
+                                self.assertTrue(result["ok"])
+                                called = update if endpoint == "/api/update" else mark
+                                self.assertEqual(len(called.call_args.args[0]), count)
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
 
 
 class DuplicateRelativePathTests(unittest.TestCase):

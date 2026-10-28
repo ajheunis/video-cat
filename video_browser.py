@@ -113,6 +113,7 @@ CACHE_DIR = os.environ.get("VB_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "VideoBrowser", "previews")
 CACHE_MAX_BYTES = 20 * 1024**3          # oldest previews are pruned beyond 20 GB
 MAX_JOBS = 2                            # concurrent ffmpeg conversions
+MAX_UPDATE_FILES = 20000                # maximum files in a single catalog update
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0   # no console pop-ups
@@ -1124,6 +1125,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(n) or b"{}")
+            if path in ("/api/mark-deletion", "/api/favorite", "/api/update"):
+                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
+                if len(rels) > MAX_UPDATE_FILES:
+                    return self._json({"ok": False, "error":
+                        f"Select at most {MAX_UPDATE_FILES:,} files at a time; no changes were made."}, 400)
             if path == "/api/settings":
                 try:
                     save_path_map(req.get("path_map"))
@@ -1134,15 +1140,12 @@ class Handler(BaseHTTPRequestHandler):
                 cands = req.get("cands") if isinstance(req.get("cands"), list) else []
                 self._json(prepare_preview(cands, bool(req.get("hevc")), bool(req.get("force"))))
             elif path == "/api/mark-deletion":
-                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
-                self._json(mark_files(rels[:20000], req.get("marked")))
+                self._json(mark_files(rels, req.get("marked")))
             elif path == "/api/favorite":
-                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
-                self._json(mark_files(rels[:20000], req.get("marked"), "favorite"))
+                self._json(mark_files(rels, req.get("marked"), "favorite"))
             elif path == "/api/update":
-                rels = req.get("rels") if isinstance(req.get("rels"), list) else []
                 changes = {k: req[k] for k in EDITABLE if k in req}
-                self._json(update_clips(rels[:20000], changes))
+                self._json(update_clips(rels, changes))
             else:
                 mode = "play" if req.get("mode") == "play" else "folder"
                 self._json(open_file(str(req.get("rel", "")), mode))
