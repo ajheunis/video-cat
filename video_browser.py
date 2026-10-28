@@ -169,7 +169,7 @@ def preview_candidates(files):
         if (f["ext"] or "").lower() in NEVER_PREVIEW:
             return None
         return {"proxy": 0, "sidecar": 1, "video": 2}.get(f["kind"])
-    ranked = [(rank(f), f["size_bytes"] or 0, f["rel_path"]) for f in files]
+    ranked = [(rank(f), f["size_bytes"] or 0, f["full_path"]) for f in files if f["full_path"]]
     return [rel for r, _, rel in sorted(x for x in ranked if x[0] is not None)]
 
 
@@ -233,9 +233,9 @@ def load_data():
         g["clips"].append({
             "time": t, "time_src": tsrc, "device": device or "", "root": root,
             "collection": primary["collection"], "location": loc, "project": proj,
-            "file": primary["filename"], "rel": primary["rel_path"], "path": primary["full_path"],
-            "rels": [f["rel_path"] for f in fs],
-            "file_details": [{"rel": f["rel_path"], "name": f["filename"],
+            "file": primary["filename"], "rel": primary["full_path"], "path": primary["full_path"],
+            "rels": [f["full_path"] for f in fs if f["full_path"]],
+            "file_details": [{"rel": f["full_path"], "name": f["filename"],
                               "kind": f["kind"], "path": f["full_path"], "marked": f["marked_for_deletion"]}
                              for f in sorted(fs, key=lambda f: f["rel_path"])],
             "marked_count": sum(bool(f["marked_for_deletion"]) for f in fs),
@@ -270,7 +270,7 @@ def load_data():
 
 def lookup_path(rel):
     with db() as con:
-        row = con.execute("SELECT full_path FROM videos WHERE rel_path = ?", [rel]).fetchone()
+        row = con.execute("SELECT full_path FROM videos WHERE full_path = ?", [rel]).fetchone()
     return local_path(row[0]) if row else None
 
 
@@ -280,9 +280,9 @@ def lookup_paths(rels):
         return {}
     with db() as con:
         rows = con.execute(
-            f"SELECT rel_path, full_path FROM videos WHERE rel_path IN ({','.join('?' * len(rels))})",
+            f"SELECT full_path FROM videos WHERE full_path IN ({','.join('?' * len(rels))})",
             rels).fetchall()
-    return {rel: local_path(full) for rel, full in rows}
+    return {full: local_path(full) for (full,) in rows}
 
 
 EDITABLE = ("project", "location")
@@ -303,7 +303,7 @@ def update_clips(rels, changes):
         return {"ok": False, "error": "Tick Project and/or Location to change."}
     try:
         with db(read_only=False) as con:
-            n = con.execute(f"UPDATE videos SET {', '.join(sets)} WHERE list_contains(?, rel_path)",
+            n = con.execute(f"UPDATE videos SET {', '.join(sets)} WHERE list_contains(?, full_path)",
                             args + [rels]).fetchone()[0]
     except duckdb.Error as e:
         return {"ok": False, "error": "Couldn't save - the catalog may be open in another program "
@@ -321,7 +321,7 @@ def mark_files(rels, marked, column="marked_for_deletion"):
             con.execute("BEGIN TRANSACTION")
             try:
                 con.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {column} BOOLEAN DEFAULT FALSE")
-                n = con.execute(f"UPDATE videos SET {column} = ? WHERE list_contains(?, rel_path)",
+                n = con.execute(f"UPDATE videos SET {column} = ? WHERE list_contains(?, full_path)",
                                 [marked, rels]).fetchone()[0]
                 con.execute("COMMIT")
             except Exception:

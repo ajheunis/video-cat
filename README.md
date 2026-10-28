@@ -93,8 +93,8 @@ The app expects a DuckDB 2 database with a `videos` table:
 | `capture_date` | DATE      |                                             |
 | `size_bytes`   | BIGINT    |                                             |
 | `modified`     | TIMESTAMP | file modified time                          |
-| `rel_path`     | VARCHAR   | unique path relative to the storage root    |
-| `full_path`    | VARCHAR   | absolute path, e.g. `H:/Processed/...`      |
+| `rel_path`     | VARCHAR   | path relative to the storage root           |
+| `full_path`    | VARCHAR   | unique absolute path, e.g. `H:/Processed/...` |
 | `location`     | VARCHAR   | optional                                    |
 | `project`      | VARCHAR   | optional                                    |
 | `collection`   | VARCHAR   | e.g. `Processed`, `Raw`                     |
